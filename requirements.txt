@@ -1,0 +1,11 @@
+# Python dependencies for lidarrscripts
+# Install with: pip install -r requirements.txt
+
+# HTTP library for API requests (used in all scripts)
+requests
+
+# MusicBrainz API client (used in mb_lidarr_import.py)
+musicbrainzngs
+
+# Spotify API client (used in spotify_playlist_checker.py)
+spotipy
