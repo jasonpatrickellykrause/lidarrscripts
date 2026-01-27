@@ -191,6 +191,45 @@ class LidarrAPI:
             return False
 
 
+def resolve_release_id(id_input: str) -> Optional[str]:
+    """Resolve a release ID or release group ID to a release ID.
+
+    If the input is a release group ID, returns the first release in that group.
+    If the input is already a release ID, returns it as-is.
+
+    Args:
+        id_input: Either a release ID or release group ID.
+
+    Returns:
+        A release ID, or None if resolution fails.
+    """
+    # First try to see if it's a release group
+    try:
+        result = musicbrainzngs.get_release_group_by_id(
+            id_input,
+            includes=['releases']
+        )
+        release_group = result['release-group']
+
+        # Check if there are releases in this group
+        if 'release-list' in release_group and release_group['release-list']:
+            first_release = release_group['release-list'][0]
+            release_id = first_release['id']
+            print(f"📀 Release group detected: {release_group.get('title', 'Unknown')}")
+            print(f"   Using first release: {first_release.get('title', 'Unknown')} ({release_id})")
+            return release_id
+        else:
+            print(f"⚠️  Release group found but has no releases")
+            return None
+
+    except musicbrainzngs.WebServiceError:
+        # Not a release group, assume it's a release ID
+        return id_input
+    except Exception as e:
+        print(f"Error resolving ID: {e}")
+        return id_input
+
+
 def get_release_artists(release_id: str) -> List[Dict]:
     """Get all artists from a MusicBrainz release.
 
@@ -276,7 +315,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='Add all artists from a MusicBrainz release to Lidarr'
     )
-    parser.add_argument('release_id', help='MusicBrainz release ID')
+    parser.add_argument('release_id', help='MusicBrainz release ID or release group ID')
     parser.add_argument('--url', required=True, help='Lidarr URL (e.g., http://localhost:8686)')
     parser.add_argument('--api-key', required=True, help='Lidarr API key')
     parser.add_argument('--monitor', action='store_true', default=True, help='Monitor artists (default: True)')
@@ -302,10 +341,20 @@ def main():
     print(f"✓ Quality profile ID: {quality_profile}")
     print(f"✓ Metadata profile ID: {metadata_profile}")
     print()
-    
+
+    # Resolve release ID (handles both release IDs and release group IDs)
+    print(f"🔍 Resolving ID {args.release_id}...")
+    resolved_release_id = resolve_release_id(args.release_id)
+
+    if not resolved_release_id:
+        print("❌ Could not resolve to a valid release ID.")
+        sys.exit(1)
+
+    print()
+
     # Get artists from MusicBrainz release
-    print(f"🎵 Fetching release {args.release_id} from MusicBrainz...")
-    artists = get_release_artists(args.release_id)
+    print(f"🎵 Fetching release {resolved_release_id} from MusicBrainz...")
+    artists = get_release_artists(resolved_release_id)
     
     if not artists:
         print("❌ No artists found for this release.")
