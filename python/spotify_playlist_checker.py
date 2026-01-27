@@ -27,7 +27,7 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 try:
@@ -68,7 +68,12 @@ class MusicBrainzClient:
         """
         self.session = requests.Session()
         self.session.headers.update(
-            {"User-Agent": user_agent, "Accept": "application/json"}
+            {
+                "User-Agent": user_agent,
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache"
+            }
         )
         self.last_request_time = 0
 
@@ -79,12 +84,13 @@ class MusicBrainzClient:
             time.sleep(MB_RATE_LIMIT - elapsed)
         self.last_request_time = time.time()
 
-    def search_artist_by_spotify_id(self, spotify_id: str) -> Dict:
+    def search_artist_by_name(self, artist_name: str, debug: bool = False) -> Dict:
         """
-        Search for artist in MusicBrainz by Spotify ID.
+        Search for artist in MusicBrainz by name.
 
         Args:
-            spotify_id: Spotify artist ID
+            artist_name: Artist name
+            debug: If True, print debug information
 
         Returns:
             Dictionary containing search results or empty dict on error
@@ -92,24 +98,36 @@ class MusicBrainzClient:
         self._rate_limit()
 
         params = {
-            "query": f'url:"https://open.spotify.com/artist/{spotify_id}"',
+            "query": f'artist:"{artist_name}"',
             "fmt": "json",
+            "limit": 10,  # Get more results for better matching
         }
+
+        if debug:
+            print(f"    Searching for artist name: {artist_name}")
 
         try:
             response = self.session.get(f"{MB_API_URL}/artist", params=params)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+
+            if debug:
+                print(f"    Search returned {len(result.get('artists', []))} result(s)")
+                if result.get('artists'):
+                    print(f"    Top result: {result['artists'][0].get('name', 'Unknown')} (ID: {result['artists'][0].get('id', 'Unknown')})")
+
+            return result
         except requests.RequestException as e:
             print(f"Warning: MusicBrainz API error: {e}", file=sys.stderr)
             return {}
 
-    def get_artist_urls(self, mb_artist_id: str) -> List[Dict]:
+    def get_artist_urls(self, mb_artist_id: str, debug: bool = False) -> List[Dict]:
         """
         Get all URLs for an artist from MusicBrainz.
 
         Args:
             mb_artist_id: MusicBrainz artist ID
+            debug: If True, print debug information
 
         Returns:
             List of relation dictionaries containing URLs
@@ -117,17 +135,71 @@ class MusicBrainzClient:
         self._rate_limit()
 
         params = {"inc": "url-rels", "fmt": "json"}
+        url = f"{MB_API_URL}/artist/{mb_artist_id}"
+
+        if debug:
+            print(f"    Requesting: {url}")
+            print(f"    MB Artist ID: {mb_artist_id}")
 
         try:
-            response = self.session.get(
-                f"{MB_API_URL}/artist/{mb_artist_id}", params=params
-            )
+            response = self.session.get(url, params=params)
             response.raise_for_status()
             data = response.json()
+
+            if debug:
+                print(f"    Response artist name: {data.get('name', 'Unknown')}")
+
             return data.get("relations", [])
         except requests.RequestException as e:
             print(f"Warning: MusicBrainz API error: {e}", file=sys.stderr)
             return []
+
+    def find_matching_artist(self, artist_name: str, spotify_id: str, debug: bool = False) -> Optional[str]:
+        """
+        Find the MusicBrainz artist ID that matches both name and Spotify ID.
+
+        Args:
+            artist_name: Artist name to search for
+            spotify_id: Spotify artist ID to validate against
+            debug: If True, print debug information
+
+        Returns:
+            MusicBrainz artist ID if a match is found, None otherwise
+        """
+        search_results = self.search_artist_by_name(artist_name, debug=debug)
+
+        if not search_results.get("artists"):
+            return None
+
+        # Try to find an artist whose Spotify URL matches our Spotify ID
+        for mb_artist in search_results["artists"]:
+            mb_id = mb_artist.get("id")
+            if not mb_id:
+                continue
+
+            if debug:
+                print(f"    Checking candidate: {mb_artist.get('name')} (MB ID: {mb_id})")
+
+            # Get URLs for this artist
+            relations = self.get_artist_urls(mb_id, debug=debug)
+
+            # Check if any Spotify URL contains our Spotify ID
+            for relation in relations:
+                if "url" in relation:
+                    url = relation["url"].get("resource", "")
+                    if re.search(SERVICE_PATTERNS["spotify"], url, re.IGNORECASE):
+                        # Extract Spotify ID from URL
+                        # Format: https://open.spotify.com/artist/{id}
+                        if f"/artist/{spotify_id}" in url:
+                            if debug:
+                                print(f"    ✓ Found matching Spotify ID in URL: {url}")
+                            return mb_id
+
+        if debug:
+            print(f"    ✗ No MusicBrainz artist found with matching Spotify ID")
+
+        # Fall back to first result if no Spotify ID match found
+        return search_results["artists"][0].get("id")
 
 
 def extract_playlist_id(playlist_url: str) -> str:
@@ -163,12 +235,13 @@ def extract_playlist_id(playlist_url: str) -> str:
     raise ValueError(f"Invalid Spotify playlist URL: {playlist_url}")
 
 
-def check_streaming_services(relations: List[Dict]) -> Dict[str, bool]:
+def check_streaming_services(relations: List[Dict], debug: bool = False) -> Dict[str, bool]:
     """
     Check which streaming services are linked in MusicBrainz relations.
 
     Args:
         relations: List of MusicBrainz relation dictionaries
+        debug: If True, print debug information about relations
 
     Returns:
         Dictionary with boolean values for each service
@@ -176,12 +249,21 @@ def check_streaming_services(relations: List[Dict]) -> Dict[str, bool]:
     services = {"spotify": False, "tidal": False, "deezer": False}
 
     for relation in relations:
-        if relation.get("type") == "streaming" and "url" in relation:
+        # MusicBrainz relations have the URL in the 'url' dict with 'resource' key
+        if "url" in relation:
             url = relation["url"].get("resource", "")
 
+            if debug:
+                print(f"    Checking URL: {url}")
+                print(f"    Relation type: {relation.get('type')}")
+
+            # Check against all patterns regardless of relation type
+            # The type field might vary (e.g., "streaming music", "free streaming", etc.)
             for service, pattern in SERVICE_PATTERNS.items():
                 if re.search(pattern, url, re.IGNORECASE):
                     services[service] = True
+                    if debug:
+                        print(f"    ✓ Matched {service}")
 
     return services
 
@@ -356,6 +438,11 @@ Examples:
         action="store_true",
         help="Only show artists missing from one or more services",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show debug information about MusicBrainz relations",
+    )
 
     return parser.parse_args()
 
@@ -411,21 +498,31 @@ def main():
     results = []
 
     for i, artist in enumerate(artists, 1):
-        print(f"[{i}/{len(artists)}] Checking {artist['name']}...", end="\r")
+        if not args.debug:
+            print(f"[{i}/{len(artists)}] Checking {artist['name']}...", end="\r")
+        else:
+            print(f"\n[{i}/{len(artists)}] {artist['name']} (Spotify ID: {artist['id']})")
 
-        # Search MusicBrainz by Spotify ID
-        mb_search = mb_client.search_artist_by_spotify_id(artist["id"])
+        # Find MusicBrainz artist that matches both name and Spotify ID
+        mb_artist_id = mb_client.find_matching_artist(
+            artist["name"],
+            artist["id"],
+            debug=args.debug
+        )
 
         services = {"spotify": False, "tidal": False, "deezer": False}
         mb_found = False
 
-        if mb_search.get("artists"):
-            mb_artist = mb_search["artists"][0]
+        if mb_artist_id:
             mb_found = True
 
             # Get URLs for the artist
-            relations = mb_client.get_artist_urls(mb_artist["id"])
-            services = check_streaming_services(relations)
+            relations = mb_client.get_artist_urls(mb_artist_id, debug=args.debug)
+
+            if args.debug:
+                print(f"    Found {len(relations)} relations")
+
+            services = check_streaming_services(relations, debug=args.debug)
 
         results.append(
             {
