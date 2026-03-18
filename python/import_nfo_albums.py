@@ -15,20 +15,103 @@ Requires: requests
 Install: pip install requests
 """
 
+import argparse
 import os
 import re
+import sys
 import xml.etree.ElementTree as ET
 from typing import List, Optional
 
 import requests
 
-# Configuration
-LIDARR_URL = "http://localhost:8686"  # Your Lidarr URL
-LIDARR_API_KEY = "your_api_key_here"  # Your Lidarr API key
-MUSIC_FOLDER_PATH = "/path/to/music"  # Root folder containing album.nfo files
-QUALITY_PROFILE_ID = 1  # Quality profile ID in Lidarr
-METADATA_PROFILE_ID = 1  # Metadata profile ID in Lidarr
-ROOT_FOLDER_PATH = "/music"  # Root folder path in Lidarr
+# Global configuration variables (set by parse_arguments)
+LIDARR_URL = None
+LIDARR_API_KEY = None
+MUSIC_FOLDER_PATH = None
+QUALITY_PROFILE_ID = None
+METADATA_PROFILE_ID = None
+ROOT_FOLDER_PATH = None
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments with environment variable fallbacks.
+
+    Environment variables:
+        LIDARR_URL: Lidarr server URL (default: http://localhost:8686)
+        LIDARR_API_KEY: Lidarr API key (no default - required)
+        MUSIC_FOLDER_PATH: Path to music folder (no default - required)
+        QUALITY_PROFILE_ID: Quality profile ID (default: 1)
+        METADATA_PROFILE_ID: Metadata profile ID (default: 1)
+        ROOT_FOLDER_PATH: Root folder path in Lidarr (default: /music)
+
+    Returns:
+        Namespace object with parsed arguments.
+    """
+    parser = argparse.ArgumentParser(
+        description="Accelerate Lidarr album imports using MusicBrainz IDs from album.nfo files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python import_nfo_albums.py --lidarr-url https://lidarr.example.com \\
+                                --api-key YOUR_KEY \\
+                                --music-folder /mnt/media/music
+
+  LIDARR_URL=https://lidarr.example.com \\
+  LIDARR_API_KEY=YOUR_KEY \\
+  MUSIC_FOLDER_PATH=/mnt/media/music \\
+  python import_nfo_albums.py
+        """
+    )
+
+    parser.add_argument(
+        "--lidarr-url",
+        default=os.getenv("LIDARR_URL", "http://localhost:8686"),
+        help="Lidarr server URL (env: LIDARR_URL)"
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.getenv("LIDARR_API_KEY"),
+        required=not os.getenv("LIDARR_API_KEY"),
+        help="Lidarr API key (env: LIDARR_API_KEY) [REQUIRED]"
+    )
+    parser.add_argument(
+        "--music-folder",
+        default=os.getenv("MUSIC_FOLDER_PATH"),
+        required=not os.getenv("MUSIC_FOLDER_PATH"),
+        help="Root folder path containing album.nfo files (env: MUSIC_FOLDER_PATH) [REQUIRED]"
+    )
+    parser.add_argument(
+        "--quality-profile-id",
+        type=int,
+        default=int(os.getenv("QUALITY_PROFILE_ID", "1")),
+        help="Quality profile ID in Lidarr (default: 1, env: QUALITY_PROFILE_ID)"
+    )
+    parser.add_argument(
+        "--metadata-profile-id",
+        type=int,
+        default=int(os.getenv("METADATA_PROFILE_ID", "1")),
+        help="Metadata profile ID in Lidarr (default: 1, env: METADATA_PROFILE_ID)"
+    )
+    parser.add_argument(
+        "--root-folder-path",
+        default=os.getenv("ROOT_FOLDER_PATH", "/music"),
+        help="Root folder path in Lidarr (default: /music, env: ROOT_FOLDER_PATH)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes"
+    )
+
+    args = parser.parse_args()
+
+    # Validate required arguments
+    if not args.api_key:
+        parser.error("--api-key is required (or set LIDARR_API_KEY environment variable)")
+    if not args.music_folder:
+        parser.error("--music-folder is required (or set MUSIC_FOLDER_PATH environment variable)")
+
+    return args
 
 
 def find_nfo_files(root_path: str) -> List[str]:
@@ -249,40 +332,76 @@ def add_album_to_lidarr(mb_id: str, artist_mb_id: Optional[str] = None) -> Optio
 
 def main() -> None:
     """Main function to process all album.nfo files and import to Lidarr.
-    
+
     Scans the configured music folder for album.nfo files, extracts MusicBrainz
     IDs, and attempts to add each album to Lidarr. Prints a summary of results.
     """
+    global LIDARR_URL, LIDARR_API_KEY, MUSIC_FOLDER_PATH, QUALITY_PROFILE_ID, METADATA_PROFILE_ID, ROOT_FOLDER_PATH
+
+    args = parse_arguments()
+
+    # Set global configuration from arguments
+    LIDARR_URL = args.lidarr_url
+    LIDARR_API_KEY = args.api_key
+    MUSIC_FOLDER_PATH = args.music_folder
+    QUALITY_PROFILE_ID = args.quality_profile_id
+    METADATA_PROFILE_ID = args.metadata_profile_id
+    ROOT_FOLDER_PATH = args.root_folder_path
+
+    print("Configuration:")
+    print(f"  Lidarr URL: {LIDARR_URL}")
+    print(f"  Music Folder: {MUSIC_FOLDER_PATH}")
+    print(f"  Quality Profile ID: {QUALITY_PROFILE_ID}")
+    print(f"  Metadata Profile ID: {METADATA_PROFILE_ID}")
+    print(f"  Root Folder Path: {ROOT_FOLDER_PATH}")
+    if args.dry_run:
+        print(f"  DRY RUN MODE: No changes will be made")
+    print()
+
     print(f"Scanning for album.nfo files in: {MUSIC_FOLDER_PATH}")
+
+    # Validate that the music folder exists
+    if not os.path.isdir(MUSIC_FOLDER_PATH):
+        print(f"✗ Error: Music folder does not exist: {MUSIC_FOLDER_PATH}")
+        sys.exit(1)
+
     nfo_files = find_nfo_files(MUSIC_FOLDER_PATH)
     print(f"Found {len(nfo_files)} album.nfo files\n")
-    
+
+    if not nfo_files:
+        print("No album.nfo files found. Exiting.")
+        sys.exit(0)
+
     added = 0
     failed = 0
     skipped = 0
     already_exists = 0
-    
+
     for nfo_path in nfo_files:
         print(f"Processing: {nfo_path}")
         mb_id = extract_musicbrainz_id(nfo_path)
-        
+
         if not mb_id:
             print(f"  ✗ No MusicBrainz ID found")
             skipped += 1
             continue
-        
+
         print(f"  Found ID: {mb_id}")
-        
-        result = add_album_to_lidarr(mb_id)
-        if result is True:
+
+        if args.dry_run:
+            print(f"  [DRY RUN] Would add album: {mb_id}")
             added += 1
-        elif result is None:
-            already_exists += 1
         else:
-            failed += 1
-        
+            result = add_album_to_lidarr(mb_id)
+            if result is True:
+                added += 1
+            elif result is None:
+                already_exists += 1
+            else:
+                failed += 1
+
         print()
-    
+
     print("\n" + "="*50)
     print(f"Summary:")
     print(f"  Total NFO files: {len(nfo_files)}")
