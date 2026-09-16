@@ -1,233 +1,79 @@
 #!/usr/bin/env python3
 """
-Clean up Lidarr library by removing missing albums and adjusting artist settings.
+Clean up a Lidarr library by removing unmonitored albums and reducing
+artist-level monitoring.
 
-This script processes all artists in your Lidarr library to:
-1. Remove missing albums (unmonitored albums or albums with no files/tracks)
-2. Set artist monitoring to "no new albums" (monitorNewItems = 'none')
-3. Set artist metadata profile to "None"
+For each artist, this script:
+1. Removes unmonitored albums that have no downloaded files
+2. Sets artist monitoring to "no new albums" (monitorNewItems = 'none')
+3. Sets artist metadata profile to "None"
 
-This is useful for cleaning up after bulk imports or reducing active monitoring load.
+This is useful for cleaning up after bulk imports or reducing active
+monitoring load. By default it only touches albums you've already chosen
+not to monitor - pass --include-empty-monitored to also remove monitored
+albums with no files, but note that will also catch upcoming releases that
+simply haven't come out yet unless they're excluded by release date, which
+this script does automatically.
 
 Requires: requests
 Install: pip install requests
-
-Created with assistance from Claude (Anthropic) - https://claude.ai
 """
 
-import sys
 import argparse
-import requests
+import os
+import sys
 import time
-from typing import List, Dict, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+from lidarr_common import LidarrClient
 
 
 class LidarrCleanup:
-    """Handle Lidarr cleanup operations including missing album removal and artist configuration.
+    """Cleanup operations: unmonitored/empty album removal and artist configuration."""
 
-    Attributes:
-        url: Base URL of the Lidarr instance.
-        api_key: API key for authentication.
-        headers: HTTP headers used for API requests.
-    """
-
-    def __init__(self, url: str, api_key: str):
-        self.url = url.rstrip('/')
-        self.api_key = api_key
-        self.headers = {
-            'X-Api-Key': api_key,
-            'Content-Type': 'application/json'
-        }
+    def __init__(self, client: LidarrClient):
+        self.client = client
         self.none_profile_id = None
 
-    def _make_request(self, endpoint: str, method: str = 'GET', data: Dict = None) -> Optional[Dict]:
-        """Make a request to the Lidarr API.
-
-        Args:
-            endpoint: API endpoint (without /api/v1/ prefix).
-            method: HTTP method (GET, POST, DELETE, PUT).
-            data: Request body for POST/PUT requests.
-
-        Returns:
-            Response JSON or None if request failed.
-        """
-        try:
-            url = f"{self.url}/api/v1/{endpoint}"
-
-            if method == 'GET':
-                resp = requests.get(url, headers=self.headers, timeout=30)
-            elif method == 'POST':
-                resp = requests.post(url, headers=self.headers, json=data, timeout=30)
-            elif method == 'PUT':
-                resp = requests.put(url, headers=self.headers, json=data, timeout=30)
-            elif method == 'DELETE':
-                resp = requests.delete(url, headers=self.headers, timeout=30)
-            else:
-                print(f"Unsupported method: {method}")
-                return None
-
-            resp.raise_for_status()
-            return resp.json() if resp.text else None
-
-        except requests.exceptions.RequestException as e:
-            print(f"Error ({method} {endpoint}): {e}")
-            return None
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            return None
-
     def get_none_metadata_profile_id(self) -> Optional[int]:
-        """Get the metadata profile ID for "None" profile.
+        """Metadata profile ID for "None", falling back to the first profile."""
+        self.none_profile_id = self.client.get_metadata_profile_id(name='None')
+        return self.none_profile_id
 
-        Returns:
-            Profile ID for "None" profile, or first profile ID if "None" doesn't exist.
+    def is_missing_album(self, album: Dict, include_empty_monitored: bool) -> bool:
+        """An album is a cleanup candidate if:
+        - It is unmonitored, regardless of whether files exist, OR
+        - `include_empty_monitored` is set, it's monitored but has zero
+          downloaded files, AND its release date has already passed (so
+          upcoming/unreleased albums are never touched).
         """
-        try:
-            profiles = self._make_request('metadataprofile')
-            if not profiles:
-                return None
-
-            # Look for "None" profile
-            for profile in profiles:
-                if profile.get('name') == 'None':
-                    self.none_profile_id = profile.get('id')
-                    return self.none_profile_id
-
-            # Fallback to first profile
-            self.none_profile_id = profiles[0].get('id')
-            return self.none_profile_id
-
-        except Exception as e:
-            print(f"Error getting metadata profiles: {e}")
-            return None
-
-    def get_all_artists(self) -> List[Dict]:
-        """Fetch all artists from Lidarr.
-
-        Returns:
-            List of artist dictionaries.
-        """
-        try:
-            artists = self._make_request('artist')
-            return artists if artists else []
-        except Exception as e:
-            print(f"Error fetching artists: {e}")
-            return []
-
-    def get_albums_for_artist(self, artist_id: int) -> List[Dict]:
-        """Fetch all albums for a specific artist.
-
-        Args:
-            artist_id: Lidarr artist ID.
-
-        Returns:
-            List of album dictionaries for the artist.
-        """
-        try:
-            albums = self._make_request('album')
-            if not albums:
-                return []
-
-            # Filter to this artist's albums
-            return [a for a in albums if a.get('artistId') == artist_id]
-
-        except Exception as e:
-            print(f"Error fetching albums for artist {artist_id}: {e}")
-            return []
-
-    def is_missing_album(self, album: Dict) -> bool:
-        """Check if an album is considered "missing".
-
-        An album is missing if:
-        - It is unmonitored (monitored=false), OR
-        - It has no tracks found (statistics.totalTrackCount=0)
-
-        Args:
-            album: Album dictionary from Lidarr API.
-
-        Returns:
-            True if album is missing, False otherwise.
-        """
-        # Check if unmonitored
         if not album.get('monitored'):
             return True
 
-        # Check if no tracks found
-        stats = album.get('statistics', {})
-        total_tracks = stats.get('totalTrackCount', 0)
-        if total_tracks == 0:
-            return True
-
-        return False
-
-    def delete_album(self, album_id: int) -> bool:
-        """Delete an album from Lidarr.
-
-        Args:
-            album_id: Lidarr album ID.
-
-        Returns:
-            True if deletion was successful, False otherwise.
-        """
-        try:
-            self._make_request(f'album/{album_id}', method='DELETE')
-            return True
-        except Exception as e:
-            print(f"Error deleting album {album_id}: {e}")
+        if not include_empty_monitored:
             return False
 
-    def update_artist(self, artist: Dict) -> bool:
-        """Update artist settings (monitoring and metadata profile).
-
-        Args:
-            artist: Artist dictionary to update.
-
-        Returns:
-            True if update was successful, False otherwise.
-        """
-        try:
-            # Prepare update payload - keep all original fields and update specific ones
-            # This ensures we don't accidentally omit required fields that Lidarr expects
-            payload = artist.copy()
-
-            # Update only the fields we need to change
-            payload['metadataProfileId'] = self.none_profile_id
-            payload['monitorNewItems'] = 'none'  # "no new albums"
-
-            # Use PUT to update existing artist
-            result = self._make_request(f'artist/{artist.get("id")}', method='PUT', data=payload)
-            return result is not None
-
-        except Exception as e:
-            print(f"Error updating artist {artist.get('artistName')}: {e}")
+        stats = album.get('statistics', {}) or {}
+        if stats.get('trackFileCount', 0) > 0:
             return False
 
-    def cleanup_artist(self, artist: Dict, dry_run: bool = False, delay: float = 0.5) -> Dict:
-        """Clean up a single artist (remove missing albums, update settings).
+        release_date = album.get('releaseDate')
+        if not release_date:
+            return False
+        try:
+            released = datetime.fromisoformat(release_date.replace('Z', '+00:00'))
+        except ValueError:
+            return False
+        return released < datetime.now(timezone.utc)
 
-        Args:
-            artist: Artist dictionary to process.
-            dry_run: If True, don't make actual changes.
-            delay: Delay in seconds between API calls.
+    def cleanup_artist(self, artist: Dict, albums: List[Dict], include_empty_monitored: bool,
+                        dry_run: bool = False, delay: float = 0.5) -> Dict:
+        """Clean up a single artist (remove missing albums, update settings)."""
+        stats = {'deleted': 0, 'failed_delete': 0, 'updated': False, 'failed_update': False}
 
-        Returns:
-            Dictionary with stats from processing this artist.
-        """
-        artist_name = artist.get('artistName', 'Unknown')
-        artist_id = artist.get('id')
+        missing_albums = [a for a in albums if self.is_missing_album(a, include_empty_monitored)]
 
-        stats = {
-            'deleted': 0,
-            'failed_delete': 0,
-            'updated': False,
-            'failed_update': False
-        }
-
-        # Get all albums for this artist
-        albums = self.get_albums_for_artist(artist_id)
-        missing_albums = [a for a in albums if self.is_missing_album(a)]
-
-        # Delete missing albums
         for album in missing_albums:
             album_title = album.get('title', 'Unknown')
             album_id = album.get('id')
@@ -235,21 +81,22 @@ class LidarrCleanup:
             if dry_run:
                 print(f"    Would delete: {album_title}")
                 stats['deleted'] += 1
+            elif self.client.delete_album(album_id):
+                print(f"    Deleted: {album_title}")
+                stats['deleted'] += 1
+                time.sleep(delay)
             else:
-                if self.delete_album(album_id):
-                    print(f"    Deleted: {album_title}")
-                    stats['deleted'] += 1
-                    time.sleep(delay)
-                else:
-                    print(f"    Failed to delete: {album_title}")
-                    stats['failed_delete'] += 1
+                print(f"    Failed to delete: {album_title}")
+                stats['failed_delete'] += 1
 
-        # Update artist settings
         if dry_run:
             print(f"    Would update monitoring and metadata profile")
             stats['updated'] = True
         else:
-            if self.update_artist(artist):
+            payload = dict(artist)
+            payload['metadataProfileId'] = self.none_profile_id
+            payload['monitorNewItems'] = 'none'
+            if self.client.update_artist(payload):
                 print(f"    Updated monitoring to 'no new albums' and metadata profile to 'None'")
                 stats['updated'] = True
                 time.sleep(delay)
@@ -259,43 +106,38 @@ class LidarrCleanup:
 
         return stats
 
-    def run(self, max_artists: Optional[int] = None, dry_run: bool = False, delay: float = 0.5) -> Dict:
-        """Run the cleanup operation on all artists.
+    def run(self, max_artists: Optional[int] = None, include_empty_monitored: bool = False,
+            dry_run: bool = False, delay: float = 0.5) -> Dict:
+        """Run the cleanup operation on all artists."""
+        print("Getting Lidarr configuration...")
 
-        Args:
-            max_artists: Maximum number of artists to process (None = all).
-            dry_run: If True, preview changes without making them.
-            delay: Delay in seconds between API calls.
-
-        Returns:
-            Dictionary with overall statistics.
-        """
-        print("🔍 Getting Lidarr configuration...")
-
-        # Get the "None" metadata profile ID
         if not self.get_none_metadata_profile_id():
-            print("❌ Could not find metadata profiles")
+            print("Error: could not find metadata profiles", file=sys.stderr)
             return {}
 
-        print(f"✓ Using metadata profile ID: {self.none_profile_id}")
+        print(f"Using metadata profile ID: {self.none_profile_id}")
         print()
 
-        # Get all artists
-        print("🎵 Fetching all artists...")
-        artists = self.get_all_artists()
-
+        print("Fetching all artists...")
+        artists = self.client.get_artists()
         if not artists:
-            print("❌ No artists found in Lidarr")
+            print("Error: no artists found in Lidarr", file=sys.stderr)
             return {}
 
-        print(f"✓ Found {len(artists)} artist(s)")
+        print(f"Found {len(artists)} artist(s)")
+
+        print("Fetching all albums...")
+        all_albums = self.client.get_albums()
+        albums_by_artist: Dict[int, List[Dict]] = {}
+        for album in all_albums:
+            albums_by_artist.setdefault(album.get('artistId'), []).append(album)
+        print(f"Found {len(all_albums)} album(s)")
         print()
 
-        # Limit artists if requested
         artists_to_process = artists
         if max_artists and len(artists) > max_artists:
             artists_to_process = artists[:max_artists]
-            print(f"⚠️  Limiting to {max_artists} artist(s) (out of {len(artists)})")
+            print(f"Limiting to {max_artists} artist(s) (out of {len(artists)})")
             print()
 
         if dry_run:
@@ -304,7 +146,6 @@ class LidarrCleanup:
             print("=" * 50)
             print()
 
-        # Process each artist
         total_stats = {
             'total_artists': len(artists_to_process),
             'total_deleted': 0,
@@ -317,7 +158,9 @@ class LidarrCleanup:
             artist_name = artist.get('artistName', 'Unknown')
             print(f"[{i}/{len(artists_to_process)}] Processing: {artist_name}")
 
-            stats = self.cleanup_artist(artist, dry_run=dry_run, delay=delay)
+            albums = albums_by_artist.get(artist.get('id'), [])
+            stats = self.cleanup_artist(artist, albums, include_empty_monitored,
+                                         dry_run=dry_run, delay=delay)
 
             total_stats['total_deleted'] += stats['deleted']
             total_stats['total_failed_delete'] += stats['failed_delete']
@@ -333,28 +176,31 @@ class LidarrCleanup:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Clean up Lidarr library by removing missing albums and updating artist settings'
+        description='Clean up a Lidarr library by removing unmonitored/empty albums and updating artist settings'
     )
     parser.add_argument('--url', required=True, help='Lidarr URL (e.g., http://localhost:8686)')
-    parser.add_argument('--api-key', required=True, help='Lidarr API key')
+    parser.add_argument('--api-key', default=os.environ.get('LIDARR_API_KEY'),
+                         help='Lidarr API key (or set LIDARR_API_KEY)')
     parser.add_argument('--max-artists', type=int, default=None,
-                       help='Maximum number of artists to process (default: all)')
+                         help='Maximum number of artists to process (default: all)')
+    parser.add_argument('--include-empty-monitored', action='store_true',
+                         help='Also remove monitored albums with no downloaded files, '
+                              'as long as their release date has already passed')
     parser.add_argument('--dry-run', action='store_true',
-                       help='Preview what would be changed without making changes')
+                         help='Preview what would be changed without making changes')
     parser.add_argument('--delay', type=float, default=0.5,
-                       help='Delay between API calls in seconds (default: 0.5)')
-    parser.add_argument('--debug', action='store_true',
-                       help='Enable debug output')
+                         help='Delay between API calls in seconds (default: 0.5)')
 
     args = parser.parse_args()
 
-    # Initialize cleanup
-    cleanup = LidarrCleanup(args.url, args.api_key)
+    if not args.api_key:
+        parser.error("--api-key is required (or set the LIDARR_API_KEY environment variable)")
 
-    # Run cleanup
-    stats = cleanup.run(max_artists=args.max_artists, dry_run=args.dry_run, delay=args.delay)
+    cleanup = LidarrCleanup(LidarrClient(args.url, args.api_key))
+    stats = cleanup.run(max_artists=args.max_artists,
+                         include_empty_monitored=args.include_empty_monitored,
+                         dry_run=args.dry_run, delay=args.delay)
 
-    # Print summary
     print("=" * 50)
     print("CLEANUP SUMMARY")
     print("=" * 50)

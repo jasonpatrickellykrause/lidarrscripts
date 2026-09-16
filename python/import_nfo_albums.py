@@ -19,10 +19,13 @@ import argparse
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from typing import List, Optional
 
 import requests
+
+from lidarr_common import build_album_payload
 
 # Global configuration variables (set by parse_arguments)
 LIDARR_URL = None
@@ -31,6 +34,7 @@ MUSIC_FOLDER_PATH = None
 QUALITY_PROFILE_ID = None
 METADATA_PROFILE_ID = None
 ROOT_FOLDER_PATH = None
+REQUEST_DELAY = 0.5
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -101,6 +105,12 @@ Examples:
         "--dry-run",
         action="store_true",
         help="Show what would be done without making changes"
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.5,
+        help="Delay between Lidarr API calls in seconds (default: 0.5)"
     )
 
     args = parser.parse_args()
@@ -217,7 +227,7 @@ def add_album_to_lidarr(mb_id: str, artist_mb_id: Optional[str] = None) -> Optio
     """
     # Check if album already exists
     if check_album_exists(mb_id):
-        print(f"  ⊘ Album already exists in Lidarr, skipping")
+        print(f"  Album already exists in Lidarr, skipping")
         return None  # Return None to indicate "already exists"
     
     url = f"{LIDARR_URL}/api/v1/album"
@@ -238,7 +248,7 @@ def add_album_to_lidarr(mb_id: str, artist_mb_id: Optional[str] = None) -> Optio
         
         results = response.json()
         if not results:
-            print(f"✗ No results found for {mb_id}")
+            print(f"  No results found for {mb_id}")
             return False
         
         # Debug: Print what we got back
@@ -266,7 +276,7 @@ def add_album_to_lidarr(mb_id: str, artist_mb_id: Optional[str] = None) -> Optio
                 break
         
         if not album_data:
-            print(f"✗ Album {mb_id} not found in search results")
+            print(f"  Album {mb_id} not found in search results")
             print(f"  Available IDs in results:")
             for result in results[:3]:  # Show first 3
                 album = result.get('album', result)
@@ -278,9 +288,9 @@ def add_album_to_lidarr(mb_id: str, artist_mb_id: Optional[str] = None) -> Optio
         # Get artist information
         artist_data = album_data.get('artist')
         if not artist_data:
-            print(f"✗ No artist data found for album {mb_id}")
+            print(f"  No artist data found for album {mb_id}")
             return False
-        
+
         # Ensure artist has required fields
         if not artist_data.get('qualityProfileId'):
             artist_data['qualityProfileId'] = QUALITY_PROFILE_ID
@@ -290,40 +300,18 @@ def add_album_to_lidarr(mb_id: str, artist_mb_id: Optional[str] = None) -> Optio
             artist_data['rootFolderPath'] = ROOT_FOLDER_PATH
         if not artist_data.get('monitored'):
             artist_data['monitored'] = True
-        
-        # Prepare the payload - include all necessary fields from search result
-        payload = {
-            "title": album_data.get('title'),
-            "foreignAlbumId": mb_id,
-            "monitored": True,
-            "anyReleaseOk": True,
-            "profileId": QUALITY_PROFILE_ID,
-            "duration": album_data.get('duration', 0),
-            "albumType": album_data.get('albumType', ''),
-            "secondaryTypes": album_data.get('secondaryTypes', []),
-            "mediumCount": album_data.get('mediumCount', 0),
-            "ratings": album_data.get('ratings', {'votes': 0, 'value': 0.0}),
-            "releaseDate": album_data.get('releaseDate'),
-            "releases": album_data.get('releases', []),
-            "genres": album_data.get('genres', []),
-            "media": album_data.get('media', []),
-            "artist": artist_data,
-            "images": album_data.get('images', []),
-            "links": album_data.get('links', []),
-            "addOptions": {
-                "searchForNewAlbum": False
-            }
-        }
-        
+
+        payload = build_album_payload(album_data, artist_data, mb_id, QUALITY_PROFILE_ID, monitored=True)
+
         # Add the album
         response = requests.post(url, headers=headers, json=payload)
         if response.status_code in [200, 201]:
             album_title = album_data.get('title', mb_id)
             artist_name = artist_data.get('artistName', 'Unknown Artist')
-            print(f"✓ Successfully added: {artist_name} - {album_title}")
+            print(f"  Successfully added: {artist_name} - {album_title}")
             return True
         else:
-            print(f"✗ Failed to add album {mb_id}: {response.status_code} - {response.text}")
+            print(f"  Failed to add album {mb_id}: {response.status_code} - {response.text}")
             return False
             
     except Exception as e:
@@ -336,7 +324,7 @@ def main() -> None:
     Scans the configured music folder for album.nfo files, extracts MusicBrainz
     IDs, and attempts to add each album to Lidarr. Prints a summary of results.
     """
-    global LIDARR_URL, LIDARR_API_KEY, MUSIC_FOLDER_PATH, QUALITY_PROFILE_ID, METADATA_PROFILE_ID, ROOT_FOLDER_PATH
+    global LIDARR_URL, LIDARR_API_KEY, MUSIC_FOLDER_PATH, QUALITY_PROFILE_ID, METADATA_PROFILE_ID, ROOT_FOLDER_PATH, REQUEST_DELAY
 
     args = parse_arguments()
 
@@ -347,6 +335,7 @@ def main() -> None:
     QUALITY_PROFILE_ID = args.quality_profile_id
     METADATA_PROFILE_ID = args.metadata_profile_id
     ROOT_FOLDER_PATH = args.root_folder_path
+    REQUEST_DELAY = args.delay
 
     print("Configuration:")
     print(f"  Lidarr URL: {LIDARR_URL}")
@@ -362,7 +351,7 @@ def main() -> None:
 
     # Validate that the music folder exists
     if not os.path.isdir(MUSIC_FOLDER_PATH):
-        print(f"✗ Error: Music folder does not exist: {MUSIC_FOLDER_PATH}")
+        print(f"Error: Music folder does not exist: {MUSIC_FOLDER_PATH}")
         sys.exit(1)
 
     nfo_files = find_nfo_files(MUSIC_FOLDER_PATH)
@@ -382,7 +371,7 @@ def main() -> None:
         mb_id = extract_musicbrainz_id(nfo_path)
 
         if not mb_id:
-            print(f"  ✗ No MusicBrainz ID found")
+            print(f"  No MusicBrainz ID found")
             skipped += 1
             continue
 
@@ -399,6 +388,7 @@ def main() -> None:
                 already_exists += 1
             else:
                 failed += 1
+            time.sleep(REQUEST_DELAY)
 
         print()
 

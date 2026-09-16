@@ -14,20 +14,26 @@ The root folder to search for music directories. Default: current directory.
 .PARAMETER MinTypes
 The minimum number of different audio file types required to report a directory. Default: 2.
 
+.PARAMETER ExportCsv
+Export results to a timestamped CSV file in the current directory without prompting.
+Use this when running the script non-interactively (e.g. from a scheduled task).
+
 .EXAMPLE
 .\Find-MixedAudioDirectory.ps1 -Path "D:\Music" -MinTypes 2
 
 Searches D:\Music for directories containing 2 or more different audio file types.
 
 .EXAMPLE
-.\Find-MixedAudioDirectory.ps1 -Path "C:\Music\Artist" -MinTypes 3
+.\Find-MixedAudioDirectory.ps1 -Path "C:\Music\Artist" -MinTypes 3 -ExportCsv
 
-Searches C:\Music\Artist for directories with 3 or more different audio file types.
+Searches C:\Music\Artist for directories with 3 or more different audio file types
+and writes the results to CSV without prompting.
 #>
 
 param(
     [string]$Path = ".",
-    [int]$MinTypes = 2
+    [int]$MinTypes = 2,
+    [switch]$ExportCsv
 )
 
 # Define common audio file extensions
@@ -69,13 +75,14 @@ foreach ($dir in $directories) {
 if ($results.Count -gt 0) {
     Write-Host "Found $($results.Count) directories with multiple audio types:`n" -ForegroundColor Green
     $results | Sort-Object -Property TypeCount -Descending | Format-Table -AutoSize
-    
-    # Export option
-    $export = Read-Host "`nExport results to CSV? (Y/N)"
-    if ($export -eq 'Y' -or $export -eq 'y') {
+
+    if ($ExportCsv) {
         $csvPath = Join-Path $PWD "AudioDirectories_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
         $results | Export-Csv -Path $csvPath -NoTypeInformation
         Write-Host "Results exported to: $csvPath" -ForegroundColor Green
+    }
+    else {
+        Write-Host "`nRun with -ExportCsv to write these results to a CSV file." -ForegroundColor Cyan
     }
 }
 else {

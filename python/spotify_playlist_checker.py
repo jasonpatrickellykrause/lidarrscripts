@@ -5,9 +5,6 @@ Spotify Playlist Artist Streaming Service Checker
 Takes a Spotify playlist URL and checks MusicBrainz for each artist's presence
 on Spotify, Tidal, and Deezer.
 
-Author: Jason (with assistance from Claude by Anthropic)
-Created: January 2026
-
 Usage:
     python spotify_playlist_checker.py <playlist_url> [options]
 
@@ -23,6 +20,7 @@ Example:
 """
 
 import argparse
+import csv
 import os
 import re
 import sys
@@ -45,7 +43,7 @@ except ImportError:
 
 # MusicBrainz API configuration
 MB_API_URL = "https://musicbrainz.org/ws/2"
-MB_USER_AGENT = "SpotifyPlaylistChecker/1.0 (https://github.com/yourusername/yourproject)"
+MB_USER_AGENT = "SpotifyPlaylistChecker/1.0 (https://github.com/jasonpatrickellykrause/lidarrscripts)"
 MB_RATE_LIMIT = 1.0  # Seconds between requests (MusicBrainz requires 1 request per second)
 
 # Streaming service URL patterns
@@ -192,11 +190,11 @@ class MusicBrainzClient:
                         # Format: https://open.spotify.com/artist/{id}
                         if f"/artist/{spotify_id}" in url:
                             if debug:
-                                print(f"    ✓ Found matching Spotify ID in URL: {url}")
+                                print(f"    Found matching Spotify ID in URL: {url}")
                             return mb_id
 
         if debug:
-            print(f"    ✗ No MusicBrainz artist found with matching Spotify ID")
+            print(f"    No MusicBrainz artist found with matching Spotify ID")
 
         # Fall back to first result if no Spotify ID match found
         return search_results["artists"][0].get("id")
@@ -263,7 +261,7 @@ def check_streaming_services(relations: List[Dict], debug: bool = False) -> Dict
                 if re.search(pattern, url, re.IGNORECASE):
                     services[service] = True
                     if debug:
-                        print(f"    ✓ Matched {service}")
+                        print(f"    Matched {service}")
 
     return services
 
@@ -320,6 +318,10 @@ def print_summary(results: List[Dict]) -> None:
     print("=" * 70)
 
     total = len(results)
+    if total == 0:
+        print("\nNo artists to report on.")
+        return
+
     in_mb = sum(1 for r in results if r["mb_found"])
     has_spotify = sum(1 for r in results if r["services"]["spotify"])
     has_tidal = sum(1 for r in results if r["services"]["tidal"])
@@ -361,9 +363,9 @@ def print_detailed(results: List[Dict]) -> None:
         print(f"  Spotify ID: {r['spotify_id']}")
         print(f"  In MusicBrainz: {'Yes' if r['mb_found'] else 'No'}")
         if r["mb_found"]:
-            print(f"  Has Spotify link: {'✓' if r['services']['spotify'] else '✗'}")
-            print(f"  Has Tidal link: {'✓' if r['services']['tidal'] else '✗'}")
-            print(f"  Has Deezer link: {'✓' if r['services']['deezer'] else '✗'}")
+            print(f"  Has Spotify link: {'Yes' if r['services']['spotify'] else 'No'}")
+            print(f"  Has Tidal link: {'Yes' if r['services']['tidal'] else 'No'}")
+            print(f"  Has Deezer link: {'Yes' if r['services']['deezer'] else 'No'}")
 
 
 def print_csv(results: List[Dict]) -> None:
@@ -373,12 +375,13 @@ def print_csv(results: List[Dict]) -> None:
     Args:
         results: List of result dictionaries for each artist
     """
-    print("Artist,Spotify ID,In MusicBrainz,Has Spotify,Has Tidal,Has Deezer")
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["Artist", "Spotify ID", "In MusicBrainz", "Has Spotify", "Has Tidal", "Has Deezer"])
     for r in results:
-        print(
-            f"{r['name']},{r['spotify_id']},{r['mb_found']},"
-            f"{r['services']['spotify']},{r['services']['tidal']},{r['services']['deezer']}"
-        )
+        writer.writerow([
+            r['name'], r['spotify_id'], r['mb_found'],
+            r['services']['spotify'], r['services']['tidal'], r['services']['deezer']
+        ])
 
 
 def check_spotify_credentials() -> tuple:
