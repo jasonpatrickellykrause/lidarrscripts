@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Script output (exports can contain API keys / import list credentials)
+lidarr_export_*.json
+lidarr_export_*.csv
+lidarr_mbids_*.txt
+*importlist*.json
+*.state

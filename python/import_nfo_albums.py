@@ -4,12 +4,13 @@ Accelerate Lidarr album imports using MusicBrainz IDs from album.nfo files.
 
 This script is useful when Lidarr has issues with text-based artist searches or when
 you need to batch import many albums quickly. It scans a music directory for album.nfo
-files, extracts MusicBrainz release group IDs, and adds those albums directly to Lidarr
-using the API. This bypasses text search issues and provides more reliable imports.
+files, extracts MusicBrainz IDs, and adds those albums directly to Lidarr using the
+API. This bypasses text search issues and provides more reliable imports.
 
 Prerequisites:
     - Each album folder must contain an album.nfo file with MusicBrainz metadata
-    - NFO files should include <musicbrainzreleasegroupid> or <musicbrainzalbumid> tags
+    - NFO files should include <musicbrainzreleasegroupid> (preferred) or
+      <musicbrainzalbumid> (a release ID; resolved to its release group via Lidarr)
 
 Requires: requests
 Install: pip install requests
@@ -21,44 +22,21 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
-import requests
+from lidarr_common import LidarrClient, build_album_payload
 
-from lidarr_common import build_album_payload
-
-# Global configuration variables (set by parse_arguments)
-LIDARR_URL = None
-LIDARR_API_KEY = None
-MUSIC_FOLDER_PATH = None
-QUALITY_PROFILE_ID = None
-METADATA_PROFILE_ID = None
-ROOT_FOLDER_PATH = None
-REQUEST_DELAY = 0.5
+UUID = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
 
 
 def parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments with environment variable fallbacks.
-
-    Environment variables:
-        LIDARR_URL: Lidarr server URL (default: http://localhost:8686)
-        LIDARR_API_KEY: Lidarr API key (no default - required)
-        MUSIC_FOLDER_PATH: Path to music folder (no default - required)
-        QUALITY_PROFILE_ID: Quality profile ID (default: 1)
-        METADATA_PROFILE_ID: Metadata profile ID (default: 1)
-        ROOT_FOLDER_PATH: Root folder path in Lidarr (default: /music)
-
-    Returns:
-        Namespace object with parsed arguments.
-    """
     parser = argparse.ArgumentParser(
-        description="Accelerate Lidarr album imports using MusicBrainz IDs from album.nfo files.",
+        description="Import albums into Lidarr using MusicBrainz IDs from album.nfo files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python import_nfo_albums.py --lidarr-url https://lidarr.example.com \\
-                                --api-key YOUR_KEY \\
-                                --music-folder /mnt/media/music
+  python import_nfo_albums.py --url http://localhost:8686 --api-key YOUR_KEY \\
+                              --music-folder /mnt/media/music --dry-run
 
   LIDARR_URL=https://lidarr.example.com \\
   LIDARR_API_KEY=YOUR_KEY \\
@@ -66,340 +44,186 @@ Examples:
   python import_nfo_albums.py
         """
     )
-
-    parser.add_argument(
-        "--lidarr-url",
-        default=os.getenv("LIDARR_URL", "http://localhost:8686"),
-        help="Lidarr server URL (env: LIDARR_URL)"
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.getenv("LIDARR_API_KEY"),
-        required=not os.getenv("LIDARR_API_KEY"),
-        help="Lidarr API key (env: LIDARR_API_KEY) [REQUIRED]"
-    )
-    parser.add_argument(
-        "--music-folder",
-        default=os.getenv("MUSIC_FOLDER_PATH"),
-        required=not os.getenv("MUSIC_FOLDER_PATH"),
-        help="Root folder path containing album.nfo files (env: MUSIC_FOLDER_PATH) [REQUIRED]"
-    )
-    parser.add_argument(
-        "--quality-profile-id",
-        type=int,
-        default=int(os.getenv("QUALITY_PROFILE_ID", "1")),
-        help="Quality profile ID in Lidarr (default: 1, env: QUALITY_PROFILE_ID)"
-    )
-    parser.add_argument(
-        "--metadata-profile-id",
-        type=int,
-        default=int(os.getenv("METADATA_PROFILE_ID", "1")),
-        help="Metadata profile ID in Lidarr (default: 1, env: METADATA_PROFILE_ID)"
-    )
-    parser.add_argument(
-        "--root-folder-path",
-        default=os.getenv("ROOT_FOLDER_PATH", "/music"),
-        help="Root folder path in Lidarr (default: /music, env: ROOT_FOLDER_PATH)"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without making changes"
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.5,
-        help="Delay between Lidarr API calls in seconds (default: 0.5)"
-    )
+    parser.add_argument('--url', '--lidarr-url', dest='url',
+                        default=os.getenv('LIDARR_URL', 'http://localhost:8686'),
+                        help='Lidarr URL (default: http://localhost:8686, env: LIDARR_URL)')
+    parser.add_argument('--api-key', default=os.getenv('LIDARR_API_KEY'),
+                        help='Lidarr API key (or set LIDARR_API_KEY)')
+    parser.add_argument('--music-folder', default=os.getenv('MUSIC_FOLDER_PATH'),
+                        help='Root folder containing album.nfo files (env: MUSIC_FOLDER_PATH)')
+    parser.add_argument('--quality-profile-id', type=int, default=int(os.getenv('QUALITY_PROFILE_ID', '1')),
+                        help='Quality profile ID for new artists/albums (default: 1, env: QUALITY_PROFILE_ID)')
+    parser.add_argument('--metadata-profile-id', type=int, default=int(os.getenv('METADATA_PROFILE_ID', '1')),
+                        help='Metadata profile ID for new artists (default: 1, env: METADATA_PROFILE_ID)')
+    parser.add_argument('--root-folder-path', default=os.getenv('ROOT_FOLDER_PATH', '/music'),
+                        help='Lidarr root folder for new artists (default: /music, env: ROOT_FOLDER_PATH)')
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be done without making changes')
+    parser.add_argument('--delay', type=float, default=0.5,
+                        help='Delay between Lidarr API calls in seconds (default: 0.5)')
 
     args = parser.parse_args()
-
-    # Validate required arguments
     if not args.api_key:
-        parser.error("--api-key is required (or set LIDARR_API_KEY environment variable)")
+        parser.error("--api-key is required (or set the LIDARR_API_KEY environment variable)")
     if not args.music_folder:
-        parser.error("--music-folder is required (or set MUSIC_FOLDER_PATH environment variable)")
-
+        parser.error("--music-folder is required (or set the MUSIC_FOLDER_PATH environment variable)")
     return args
 
 
 def find_nfo_files(root_path: str) -> List[str]:
-    """Find all album.nfo files in the directory tree.
-    
-    Args:
-        root_path: Root directory to search for NFO files.
-        
-    Returns:
-        List of absolute paths to album.nfo files found.
-    """
+    """All album.nfo files under root_path."""
     nfo_files = []
-    for root, dirs, files in os.walk(root_path):
+    for root, _dirs, files in os.walk(root_path):
         for file in files:
-            if file.lower() == "album.nfo":
+            if file.lower() == 'album.nfo':
                 nfo_files.append(os.path.join(root, file))
     return nfo_files
 
-def extract_musicbrainz_id(nfo_path: str) -> Optional[str]:
-    """Extract MusicBrainz release group ID from NFO file.
-    
-    Attempts to parse the NFO file as XML (Kodi format) first, looking for
-    musicbrainzreleasegroupid or musicbrainzalbumid tags. Falls back to
-    regex pattern matching if XML parsing fails.
-    
-    Args:
-        nfo_path: Path to the album.nfo file.
-        
-    Returns:
-        MusicBrainz release group ID if found, None otherwise.
+
+def extract_musicbrainz_id(nfo_path: str) -> Optional[Tuple[str, str]]:
+    """Return (kind, mbid) from a Kodi-style album.nfo, where kind is
+    'releasegroup' or 'release'. Falls back to a regex if the XML is malformed.
     """
+    tags = (('musicbrainzreleasegroupid', 'releasegroup'), ('musicbrainzalbumid', 'release'))
     try:
-        # Try parsing as XML first (Kodi format)
-        tree = ET.parse(nfo_path)
-        root = tree.getroot()
-        
-        # Look for musicbrainzreleasegroupid tag
-        mb_id = root.find('.//musicbrainzreleasegroupid')
-        if mb_id is not None and mb_id.text:
-            return mb_id.text.strip()
-        
-        # Also check for musicbrainzalbumid as fallback
-        mb_id = root.find('.//musicbrainzalbumid')
-        if mb_id is not None and mb_id.text:
-            return mb_id.text.strip()
-            
+        root = ET.parse(nfo_path).getroot()
+        for tag, kind in tags:
+            node = root.find(f'.//{tag}')
+            if node is not None and node.text and re.fullmatch(UUID, node.text.strip(), re.IGNORECASE):
+                return kind, node.text.strip().lower()
     except ET.ParseError:
-        # If XML parsing fails, try regex search
         try:
-            with open(nfo_path, 'r', encoding='utf-8') as f:
+            with open(nfo_path, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-                # Look for UUID format
-                match = re.search(r'<musicbrainzreleasegroupid>([a-f0-9-]{36})</musicbrainzreleasegroupid>', content, re.IGNORECASE)
+            for tag, kind in tags:
+                match = re.search(rf'<{tag}>\s*({UUID})\s*</{tag}>', content, re.IGNORECASE)
                 if match:
-                    return match.group(1)
-                match = re.search(r'<musicbrainzalbumid>([a-f0-9-]{36})</musicbrainzalbumid>', content, re.IGNORECASE)
-                if match:
-                    return match.group(1)
-        except Exception as e:
-            print(f"Error reading {nfo_path}: {e}")
-    
+                    return kind, match.group(1).lower()
+        except OSError as e:
+            print(f"  Error reading {nfo_path}: {e}")
     return None
 
-def check_album_exists(mb_id: str) -> bool:
-    """Check if album already exists in Lidarr.
-    
-    Args:
-        mb_id: MusicBrainz release group ID to check.
-        
-    Returns:
-        True if album exists in Lidarr, False otherwise.
-    """
-    url = f"{LIDARR_URL}/api/v1/album"
-    headers = {"X-Api-Key": LIDARR_API_KEY}
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            albums = response.json()
-            for album in albums:
-                if album.get('foreignAlbumId') == mb_id:
-                    return True
-    except Exception as e:
-        print(f"  Error checking if album exists: {e}")
-    
-    return False
 
-def add_album_to_lidarr(mb_id: str, artist_mb_id: Optional[str] = None) -> Optional[bool]:
-    """Add album to Lidarr using MusicBrainz release group ID.
-    
-    Searches for the album in Lidarr's database and adds it with the configured
-    quality and metadata profiles. Checks for existing albums before attempting
-    to add.
-    
-    Args:
-        mb_id: MusicBrainz release group ID.
-        artist_mb_id: Optional MusicBrainz artist ID (currently unused).
-        
-    Returns:
-        True if album was successfully added.
-        False if adding failed.
-        None if album already exists in Lidarr.
-    """
-    # Check if album already exists
-    if check_album_exists(mb_id):
-        print(f"  Album already exists in Lidarr, skipping")
-        return None  # Return None to indicate "already exists"
-    
-    url = f"{LIDARR_URL}/api/v1/album"
-    headers = {
-        "X-Api-Key": LIDARR_API_KEY,
-        "Content-Type": "application/json"
-    }
-    
-    # Search for the album first (using lidarr: prefix for MusicBrainz ID search)
-    search_url = f"{LIDARR_URL}/api/v1/search"
-    params = {"term": f"lidarr:{mb_id}"}
-    
-    try:
-        response = requests.get(search_url, headers=headers, params=params)
-        if response.status_code != 200:
-            print(f"Failed to search for album {mb_id}")
-            return False
-        
-        results = response.json()
-        if not results:
-            print(f"  No results found for {mb_id}")
-            return False
-        
-        # Debug: Print what we got back
-        print(f"  Found {len(results)} search result(s)")
-        
-        # Find the album in search results - handle different response structures
-        album_data = None
-        artist_data = None
-        
-        for i, result in enumerate(results):
-            # Lidarr search can return: album objects directly, or nested in 'album' key
-            if result.get('album'):
-                current_album = result['album']
-                current_artist = result.get('artist')
-            else:
-                current_album = result
-                current_artist = result.get('artist')
-            
-            # Check if this is our album
-            foreign_id = current_album.get('foreignAlbumId', '')
-            if foreign_id == mb_id or foreign_id.endswith(mb_id):
-                album_data = current_album
-                artist_data = current_artist
-                print(f"  Matched album: {current_album.get('title', 'Unknown')}")
-                break
-        
-        if not album_data:
-            print(f"  Album {mb_id} not found in search results")
-            print(f"  Available IDs in results:")
-            for result in results[:3]:  # Show first 3
-                album = result.get('album', result)
-                fid = album.get('foreignAlbumId', 'N/A')
-                title = album.get('title', 'N/A')
-                print(f"    - {fid}: {title}")
-            return False
-        
-        # Get artist information
-        artist_data = album_data.get('artist')
-        if not artist_data:
-            print(f"  No artist data found for album {mb_id}")
-            return False
+def find_album(results: List[Dict], kind: str, mb_id: str) -> Optional[Dict]:
+    """Pick the album matching mb_id out of Lidarr search results. A release ID
+    matches the album whose releases include it."""
+    for result in results or []:
+        album = result.get('album') or result
+        if kind == 'releasegroup' and album.get('foreignAlbumId') == mb_id:
+            return album
+        if kind == 'release' and any(r.get('foreignReleaseId') == mb_id for r in album.get('releases') or []):
+            return album
+    return None
 
-        # Ensure artist has required fields
-        if not artist_data.get('qualityProfileId'):
-            artist_data['qualityProfileId'] = QUALITY_PROFILE_ID
-        if not artist_data.get('metadataProfileId'):
-            artist_data['metadataProfileId'] = METADATA_PROFILE_ID
-        if not artist_data.get('rootFolderPath'):
-            artist_data['rootFolderPath'] = ROOT_FOLDER_PATH
-        if not artist_data.get('monitored'):
-            artist_data['monitored'] = True
 
-        payload = build_album_payload(album_data, artist_data, mb_id, QUALITY_PROFILE_ID, monitored=True)
+def resolve_album(client: LidarrClient, kind: str, mb_id: str) -> Optional[Dict]:
+    """Look the ID up through Lidarr's search (read-only). None if not found."""
+    results = client.search(f'lidarr:{mb_id}')
+    if results is None:
+        print("  Lidarr search failed")
+        return None
+    album = find_album(results, kind, mb_id)
+    if not album:
+        print(f"  {kind} {mb_id} not found in Lidarr search results")
+    return album
 
-        # Add the album
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code in [200, 201]:
-            album_title = album_data.get('title', mb_id)
-            artist_name = artist_data.get('artistName', 'Unknown Artist')
-            print(f"  Successfully added: {artist_name} - {album_title}")
-            return True
-        else:
-            print(f"  Failed to add album {mb_id}: {response.status_code} - {response.text}")
-            return False
-            
-    except Exception as e:
-        print(f"Error adding album {mb_id}: {e}")
-        return False
+
+def add_album(client: LidarrClient, args, kind: str, mb_id: str, existing: Set[str]) -> str:
+    """Returns 'added', 'would add', 'exists' or 'failed'. With --dry-run nothing is written."""
+    if kind == 'releasegroup' and mb_id in existing:
+        return 'exists'
+
+    album = resolve_album(client, kind, mb_id)
+    if not album:
+        return 'failed'
+
+    group_id = album.get('foreignAlbumId')
+    if group_id in existing:
+        return 'exists'
+    if args.dry_run:
+        print(f"  [DRY RUN] Would add: {(album.get('artist') or {}).get('artistName', '?')} - {album.get('title', group_id)}")
+        return 'would add'
+
+    artist = album.get('artist')
+    if not artist:
+        print(f"  No artist data for {album.get('title', mb_id)}")
+        return 'failed'
+    # Search results for artists not yet in Lidarr carry 0/empty here, so fill falsy values, not just missing keys.
+    for key, value in (('qualityProfileId', args.quality_profile_id),
+                       ('metadataProfileId', args.metadata_profile_id),
+                       ('rootFolderPath', args.root_folder_path)):
+        if not artist.get(key):
+            artist[key] = value
+    artist['monitored'] = True
+
+    payload = build_album_payload(album, artist, group_id, args.quality_profile_id, monitored=True)
+    outcome = client.add_album(payload)
+    if outcome == 'added':
+        existing.add(group_id)
+        print(f"  Added: {artist.get('artistName', 'Unknown Artist')} - {album.get('title', group_id)}")
+        return 'added'
+    if outcome == 'skipped':
+        existing.add(group_id)
+        return 'exists'
+    return 'failed'
+
 
 def main() -> None:
-    """Main function to process all album.nfo files and import to Lidarr.
-
-    Scans the configured music folder for album.nfo files, extracts MusicBrainz
-    IDs, and attempts to add each album to Lidarr. Prints a summary of results.
-    """
-    global LIDARR_URL, LIDARR_API_KEY, MUSIC_FOLDER_PATH, QUALITY_PROFILE_ID, METADATA_PROFILE_ID, ROOT_FOLDER_PATH, REQUEST_DELAY
-
     args = parse_arguments()
 
-    # Set global configuration from arguments
-    LIDARR_URL = args.lidarr_url
-    LIDARR_API_KEY = args.api_key
-    MUSIC_FOLDER_PATH = args.music_folder
-    QUALITY_PROFILE_ID = args.quality_profile_id
-    METADATA_PROFILE_ID = args.metadata_profile_id
-    ROOT_FOLDER_PATH = args.root_folder_path
-    REQUEST_DELAY = args.delay
-
     print("Configuration:")
-    print(f"  Lidarr URL: {LIDARR_URL}")
-    print(f"  Music Folder: {MUSIC_FOLDER_PATH}")
-    print(f"  Quality Profile ID: {QUALITY_PROFILE_ID}")
-    print(f"  Metadata Profile ID: {METADATA_PROFILE_ID}")
-    print(f"  Root Folder Path: {ROOT_FOLDER_PATH}")
+    print(f"  Lidarr URL: {args.url}")
+    print(f"  Music Folder: {args.music_folder}")
+    print(f"  Quality Profile ID: {args.quality_profile_id}")
+    print(f"  Metadata Profile ID: {args.metadata_profile_id}")
+    print(f"  Root Folder Path: {args.root_folder_path}")
     if args.dry_run:
-        print(f"  DRY RUN MODE: No changes will be made")
+        print("  DRY RUN MODE: No changes will be made")
     print()
 
-    print(f"Scanning for album.nfo files in: {MUSIC_FOLDER_PATH}")
-
-    # Validate that the music folder exists
-    if not os.path.isdir(MUSIC_FOLDER_PATH):
-        print(f"Error: Music folder does not exist: {MUSIC_FOLDER_PATH}")
+    if not os.path.isdir(args.music_folder):
+        print(f"Error: Music folder does not exist: {args.music_folder}")
         sys.exit(1)
 
-    nfo_files = find_nfo_files(MUSIC_FOLDER_PATH)
+    print(f"Scanning for album.nfo files in: {args.music_folder}")
+    nfo_files = find_nfo_files(args.music_folder)
     print(f"Found {len(nfo_files)} album.nfo files\n")
-
     if not nfo_files:
-        print("No album.nfo files found. Exiting.")
         sys.exit(0)
 
-    added = 0
-    failed = 0
-    skipped = 0
-    already_exists = 0
+    client = LidarrClient(args.url, args.api_key)
+    albums = client.get_json('album')
+    if albums is None:
+        print("Error: could not read albums from Lidarr (check URL and API key)")
+        sys.exit(1)
+    existing = {a.get('foreignAlbumId') for a in albums}  # fetched once, kept up to date as we add
 
+    counts = {'added': 0, 'would add': 0, 'exists': 0, 'failed': 0, 'no id': 0}
     for nfo_path in nfo_files:
         print(f"Processing: {nfo_path}")
-        mb_id = extract_musicbrainz_id(nfo_path)
-
-        if not mb_id:
-            print(f"  No MusicBrainz ID found")
-            skipped += 1
+        found = extract_musicbrainz_id(nfo_path)
+        if not found:
+            print("  No MusicBrainz ID found")
+            counts['no id'] += 1
             continue
+        kind, mb_id = found
+        print(f"  Found {kind} ID: {mb_id}")
 
-        print(f"  Found ID: {mb_id}")
+        outcome = add_album(client, args, kind, mb_id, existing)
+        if outcome == 'exists':
+            print("  Already in Lidarr, skipping")
+        counts[outcome] += 1
+        time.sleep(args.delay)
 
-        if args.dry_run:
-            print(f"  [DRY RUN] Would add album: {mb_id}")
-            added += 1
-        else:
-            result = add_album_to_lidarr(mb_id)
-            if result is True:
-                added += 1
-            elif result is None:
-                already_exists += 1
-            else:
-                failed += 1
-            time.sleep(REQUEST_DELAY)
-
-        print()
-
-    print("\n" + "="*50)
-    print(f"Summary:")
+    print("\n" + "=" * 50)
+    print("Summary:")
     print(f"  Total NFO files: {len(nfo_files)}")
-    print(f"  Successfully added: {added}")
-    print(f"  Already in Lidarr: {already_exists}")
-    print(f"  Failed: {failed}")
-    print(f"  Skipped (no ID): {skipped}")
-    print("="*50)
+    print(f"  {'Would add' if args.dry_run else 'Added'}: {counts['would add' if args.dry_run else 'added']}")
+    print(f"  Already in Lidarr: {counts['exists']}")
+    print(f"  Failed: {counts['failed']}")
+    print(f"  Skipped (no ID): {counts['no id']}")
+    print("=" * 50)
+    sys.exit(1 if counts['failed'] else 0)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

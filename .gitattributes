@@ -1,0 +1,6 @@
+* text=auto
+# Keep LF so scripts copied from a Windows checkout still run on Linux (shebang + CRLF breaks them)
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
